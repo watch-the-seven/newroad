@@ -42,7 +42,8 @@ IRON = "iron"
 COPPER = "copper"
 ORES = (STONE, IRON, COPPER)
 MINE_KINDS = (STONE, IRON, COPPER)
-ORE_SELL_THRESHOLD = 20  # 脚本口径：某种矿攒够 20 个就去小贩处卖掉
+ORE_SELL_THRESHOLD = 20  # 铜+铁**合计**攒够 20 就到小贩处清空背包
+                         # （与口述脚本"单一矿种 20"的差异见 README 偏差清单）
 
 #: roleType 取值（接口文档 1.3.1）
 STATION = "station"

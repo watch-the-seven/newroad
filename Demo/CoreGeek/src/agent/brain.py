@@ -88,6 +88,9 @@ class MatchState:
         self.worker_ids: dict[str, int] = {}               # {"A": 工人A的ID, "B": 工人B的ID}
         # 已挖够当日石头配额的 (天, 单位ID)，避免"建一面墙花掉石头后又跑回去挖"
         self.stone_quota: set[tuple[int, int]] = set()
+        # 正在清仓的工人ID：合计到 20 后要把背包里的铜和铁全部卖光（一回合一种）。
+        # 需要它是因为卖掉第一种后"合计"就掉到 20 以下了，光看合计会漏掉第二种。
+        self.sell_pending: set[int] = set()
 
     def sync(self, turn: Turn) -> None:
         """每回合开头调用：识别新一局、锁定布局与工人编号。"""
@@ -329,7 +332,7 @@ def _apply_step(
     if kind == "upgrade":
         return _step_upgrade(turn, state, role, layout, claimed)
     if kind == "ore":
-        return _step_ore(turn, role, claimed)
+        return _step_ore(turn, state, role, claimed)
     if kind == "buy":
         return _step_buy(turn, role, str(step[1]), int(step[2]), claimed)
     if kind == "stance":
@@ -596,19 +599,36 @@ def _step_upgrade(
     return None
 
 
-def _step_ore(turn: Turn, role: Unit, claimed: set[Pos]) -> Any:
-    """挖矿主线：卖满 20 的矿 → （背包满时清仓）→ 挖最近的铁/铜。
+def _step_ore(turn: Turn, state: MatchState, role: Unit, claimed: set[Pos]) -> Any:
+    """挖矿主线：铜+铁合计满 20 就去小贩处清空背包，否则挖最近的铁/铜。
 
-    脚本口径："挖最近的铜矿或铁矿，挖够 20 个就去卖给小贩"，
-    且石头单独管理（不参与这里的卖矿），所以只看 IRON/COPPER 两种。
+    卖矿规则（与脚本口径的差异见 README 偏差清单）：
+    * 触发条件是 **铜 + 铁 合计 >= 20**，而不是"某一种到 20"；
+    * 触发后把背包里的铜和铁**全部卖光**：一回合只能卖一种矿（接口的
+      ``sell`` 只接受单个 ``name``，见接口文档 2.2/2.3），所以
+      "只有一种"就 1 回合卖完，"两种都有"就 2 回合卖完；
+    * ``state.sell_pending`` 记录"正在清仓"：卖掉第一种后合计会掉到 20 以下，
+      没有这个标记就会漏卖第二种。
+
+    石头完全不参与卖矿（它只用于砌墙/补墙），只有背包真满时的兜底才会清石头。
     """
-    # 1) 某种矿攒够 20 就先去卖掉（铜价 5 > 铁价 3，所以先看铜）
-    for ore in (COPPER, IRON):
-        amount = role.count(ore)
-        if amount >= ORE_SELL_THRESHOLD:
-            outcome = _step_sell(turn, role, ore, amount, claimed)
-            if outcome is not None:
-                return outcome
+    copper = role.count(COPPER)
+    iron = role.count(IRON)
+    total = copper + iron
+    clearing = role.unit_id in state.sell_pending
+    if clearing and total == 0:          # 已经清空了，结束清仓状态
+        state.sell_pending.discard(role.unit_id)
+        clearing = False
+
+    # 1) 该卖矿了：合计到阈值，或正在清仓途中
+    if total > 0 and (clearing or total >= ORE_SELL_THRESHOLD):
+        if not clearing:
+            state.sell_pending.add(role.unit_id)   # 进入清仓：接下来要把铜铁都卖掉
+        ore, amount = (COPPER, copper) if copper else (IRON, iron)   # 铜先（单价 5 > 铁 3）
+        outcome = _step_sell(turn, role, ore, amount, claimed)
+        if outcome is not None:
+            return outcome
+
     # 2) 背包满了（100 格）就清仓，石头放最后——它是建墙/修墙的材料，尽量留着
     if role.backpack_full:
         for ore in (COPPER, IRON, STONE):

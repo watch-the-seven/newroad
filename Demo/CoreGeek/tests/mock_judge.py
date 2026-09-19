@@ -204,6 +204,9 @@ class World:
         self.mine_uses: dict[tuple[int, int], int] = {}
         # 本回合采空、等待下回合刷新的矿种（任务书 4.1："下回合会随机刷新"）
         self._pending_respawn: list[str] = []
+        # 阵亡登记：[(第几天, 单位ID)]，以及等待复活的单位（任务书 4.5.2）
+        self.deaths: list[tuple[int, int]] = []
+        self._dead_units: list[list] = []
         # 围墙 ID 从 40000 起（接口文档 1.3.1 的 ID 分配规则）
         self.next_id = 40000
         # 两类问题分开记：
@@ -892,6 +895,16 @@ class World:
         for kind in self._pending_respawn:
             self._respawn_mine(kind)
         self._pending_respawn.clear()
+        # 阵亡角色的复活（任务书 4.5.2：第二天白天开始后 20 回合，背包保留）
+        for entry in list(self._dead_units):
+            respawn_round, unit = entry
+            if round_no < respawn_round:
+                continue
+            unit.health = 220 if unit.kind == "worker" else 200
+            unit.pos = self._free_spot_near_base()
+            self.units.append(unit)
+            self._dead_units.remove(entry)
+            self.events.append(f"r{round_no} {unit.kind} {unit.unit_id} 在基地复活")
         # 武器冷却递减（接口文档 1.3.1 cooldown：剩余回合数）
         for tower in self.towers.values():
             if tower.cooldown > 0:
@@ -942,7 +955,25 @@ class World:
         goals = self._base_targets()
         for robot in self.robots:
             _health, damage = ROBOT_STATS[robot.kind]
-            # 优先拆挡路的围墙：打相邻的墙里血量最低的那面
+            # 任务书 4.7.3：机器人会攻击阻挡其移动的单位（包括角色与建筑）。
+            # 角色远比墙脆（工人 220 血 vs 3 级墙 2000 血），所以"夜里在外面挖矿
+            # 安不安全"完全取决于这一条——之前 mock 漏了它，导致夜间外出零风险。
+            blockers = [
+                unit
+                for unit in self.units
+                if unit.kind in ("worker", "pioneer") and self.adjacent(robot.pos, unit.pos)
+            ]
+            if blockers:
+                victim_unit = min(blockers, key=lambda u: (u.health, u.unit_id))
+                victim_unit.health -= damage
+                self.events.append(
+                    f"r{round_no} {victim_unit.kind} {victim_unit.unit_id} "
+                    f"被 {robot.kind} 打到 {victim_unit.health}"
+                )
+                if victim_unit.health <= 0:
+                    self._kill_unit(victim_unit, round_no)
+                continue
+            # 其次拆挡路的围墙：打相邻的墙里血量最低的那面
             adjacent_wall = [
                 pos
                 for pos in self.walls
@@ -986,6 +1017,28 @@ class World:
             if best is not None:
                 robot.pos = best[1]
 
+    def _kill_unit(self, unit, round_no: int) -> None:
+        """角色阵亡：移出战场并登记复活。
+
+        任务书 4.5.2："角色阵亡后，第二天白天开始后 20 回合可以在基地复活，
+        背包物品保留。" 所以复活回合 = 第 day+1 天的第 20 个白天回合。
+        """
+        day = (round_no - 1) // ROUNDS_PER_DAY + 1
+        self.units = [u for u in self.units if u.unit_id != unit.unit_id]
+        self.deaths.append((day, unit.unit_id))
+        self.events.append(f"r{round_no} {unit.kind} {unit.unit_id} 阵亡（第 {day} 天）")
+        self._dead_units.append([day * ROUNDS_PER_DAY + 20, unit])
+
+    def _free_spot_near_base(self) -> tuple[int, int]:
+        """在基地附近找一个空格（角色复活用）。"""
+        for radius in range(1, 5):
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    pos = (self.base[0] + dx, self.base[1] + dy)
+                    if self.land(pos) and not self.occupant(pos):
+                        return pos
+        return self.base
+
     def _check_fence(self, round_no: int, day: int) -> None:
         """每回合记录"缺几面墙"，供 report 判断围栏何时补齐、夜里是否留破口。"""
         missing = [pos for pos in self.all_wall_cells() if (pos.x, pos.y) not in self.walls]
@@ -1025,6 +1078,13 @@ def report(world: World, label: str) -> list[str]:
     print(f"  prompts / sandbox   : {world.prompts} / {world.execs}")
     print(f"  purchases           : {world.buys}")
     # rejected = 指令合法但没生效（真判题器只跳过该指令，不计异常）
+    alive = [f"{u.kind}{u.unit_id}" for u in world.units if u.kind in ("worker", "pioneer")]
+    hp = {u.unit_id: u.health for u in world.units if u.kind in ("worker", "pioneer")}
+    print(f"  角色阵亡            : {world.deaths or '无'}")
+    # 默认波次（现实强度）下不应该有人阵亡：这是"夜里外出/站位是否安全"的回归闸门
+    if world.deaths:
+        problems.append(f"{label}: 默认波次下出现阵亡 {world.deaths}")
+    print(f"  角色存活/血量       : {alive} {hp}")
     print(f"  rejected (rule)     : {len(world.rejected)}")
     for line in world.rejected[:8]:
         print(f"      - {line}")
