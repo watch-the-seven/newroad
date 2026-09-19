@@ -202,6 +202,8 @@ class World:
         # 矿区：坐标 -> 矿种；mine_uses 记录剩余可采次数（任务书 4.1：采集 10 次后消失）
         self.mines: dict[tuple[int, int], str] = {}
         self.mine_uses: dict[tuple[int, int], int] = {}
+        # 本回合采空、等待下回合刷新的矿种（任务书 4.1："下回合会随机刷新"）
+        self._pending_respawn: list[str] = []
         # 围墙 ID 从 40000 起（接口文档 1.3.1 的 ID 分配规则）
         self.next_id = 40000
         # 两类问题分开记：
@@ -242,6 +244,16 @@ class World:
         x, y = self.base
         return (x - 2, y - 3, x + 3, y + 2)
 
+    def _clear_of_fence(self, x: int, y: int) -> bool:
+        """该格是否在我们围栏区之外（含外扩 1 格）。
+
+        任务书 4.1：矿区"不会生成在可建造区域内"，采空后的刷新同样如此。
+        mock 里用围栏矩形+外扩 1 格来近似"可建造区域"，否则矿会落在我们要砌墙的
+        格子上，把围栏永久卡成 15/16（真机不会出现这种情况）。
+        """
+        x0, y0, x1, y1 = self._fence_rect()
+        return not (x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1)
+
     def _seed_mines(self) -> None:
         """随机撒矿：矿区不会生成在可建造区域内（任务书 4.1）。"""
         kinds = ["stone", "iron", "copper"]
@@ -254,13 +266,12 @@ class World:
             *TASK_POINTS.values(),
             *(c for cells in TASK_POINT_CELLS.values() for c in cells),
         }
-        x0, y0, x1, y1 = self._fence_rect()
         candidates = []
         # 留出边界一圈（range(1, W-1)），避免矿贴在地图边缘影响走位测试
         for y in range(1, HEIGHT - 1):
             for x in range(1, WIDTH - 1):
                 # 围栏及其外扩 1 格内不刷矿，保证建墙流程不被矿区挡住
-                if x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1:
+                if not self._clear_of_fence(x, y):
                     continue
                 if (x, y) in reserved:
                     continue
@@ -573,18 +584,23 @@ class World:
             return
         unit.backpack.append(kind)
         self.mine_uses[target] -= 1
-        # 每个矿采集 10 次后消失，并随机刷新到地图其他区域（任务书 4.1）
+        # 每个矿采集 10 次后消失（任务书 4.1）
         if self.mine_uses[target] <= 0:
             self.mines.pop(target, None)
             self.mine_uses.pop(target, None)
-            self._respawn_mine(kind)
+            # 注意：任务书说的是"**下回合**会随机刷新在地图的其他区域"，
+            # 所以这里只登记待刷新的矿种，真正的重生放到本回合结尾的 tick() 里做。
+            # 若当回合立刻重生，同回合稍后行动的另一个工人可能正好要走进这格，
+            # 在 mock 里会表现为"move into blocked"的假失败（真机不会）。
+            self._pending_respawn.append(kind)
 
     def _respawn_mine(self, kind: str) -> None:
         """矿采空后在随机空地重生（任务书 4.1：下回合随机刷新）。"""
         # 最多试 500 次，避免地图被占满时死循环
         for _ in range(500):
             pos = (self.rng.randrange(1, WIDTH - 1), self.rng.randrange(1, HEIGHT - 1))
-            if self.land(pos) and not self.occupant(pos):
+            # 同样排除围栏区：可建造区域内不刷矿（任务书 4.1）
+            if self.land(pos) and not self.occupant(pos) and self._clear_of_fence(*pos):
                 self.mines[pos] = kind
                 self.mine_uses[pos] = 10
                 return
@@ -595,6 +611,14 @@ class World:
         targets = self._targets(command)
         name = str(command.get("name") or "")
         if unit is None:
+            return
+        # 任务书 4.4：建造(build) 仅工人在白天可用，黑夜不可用。
+        # mock 早期版本漏了这条校验，导致 agent"夜里补墙"这种非法行为也能通过测试，
+        # 所以这里必须拦（夜里建墙 = 指令执行失败，浪费一个回合）。
+        if (round_no - 1) % ROUNDS_PER_DAY >= DAY_ROUNDS:
+            self.rejected.append(
+                f"r{round_no}: u{unit_id} 夜里不能建造 {name}（任务书 4.4：建造仅白天）"
+            )
             return
         # build 需要同时给 name 与 1 个 targetPos（接口文档 2.3）
         if len(targets) != 1 or not name:
@@ -687,6 +711,9 @@ class World:
         unit = self._actor(unit_id, round_no, "use")
         name = str(command.get("name") or "")
         targets = self._targets(command)
+        # 注意：`use`（含围墙修补包、基地升级券）**没有**昼夜限制，夜里可以正常使用。
+        # 夜里唯一不能做的是 `build`（见 _do_build），所以"夜里不能修围墙"指的是
+        # 不能用建造动作补墙，而不是不能用围墙修补包。
         if unit is None:
             return
         # 物品必须先在背包里（购买后才可用）
@@ -861,6 +888,10 @@ class World:
         """
         round_in_day = (round_no - 1) % ROUNDS_PER_DAY
         day = (round_no - 1) // ROUNDS_PER_DAY + 1
+        # 本回合采空的矿，到下回合才刷新（任务书 4.1），所以在这里统一重生
+        for kind in self._pending_respawn:
+            self._respawn_mine(kind)
+        self._pending_respawn.clear()
         # 武器冷却递减（接口文档 1.3.1 cooldown：剩余回合数）
         for tower in self.towers.values():
             if tower.cooldown > 0:
@@ -1027,22 +1058,30 @@ def report(world: World, label: str) -> list[str]:
         (round_no for round_no, missing in world.wall_holes_seen if missing == 0), None
     )
     print(f"  fence completed at  : round {first_full}")
-    # 允许第 1 天白天没建完、夜里接着补，但必须在第 1 夜结束前补齐
-    if first_full is None or first_full > ROUNDS_PER_DAY:
+    # 夜里不能建墙（任务书 4.4），所以第 1 天白天没建完的围栏只能等第 2 天白天补，
+    # 这里允许拖到第 2 天白天结束前补齐（选手口述："白天没修完就没修完吧"）。
+    if first_full is None or first_full > 2 * ROUNDS_PER_DAY:
         problems.append(
-            f"{label}: fence not completed by the end of night 1 (round {first_full})"
+            f"{label}: fence not completed by the end of day 2 (round {first_full})"
         )
     # 基地升级券必须买到（基地血量 <500 时的救命手段，用户口述规则）
     if not any(name == "StationUpgradeVoucher1" for _, name, _ in world.buys):
         problems.append(f"{label}: station upgrade voucher was never bought")
-    # 每一夜结束时都不能留破口（夜间修补职责是否生效）
-    night_ends = [
+    # 白天收工（每天第 70 回合）时围栏不该有缺口：夜里不能修墙，被打坏只能等
+    # 第二天白天补，所以这是"白天修补职责是否生效"的检查。第 1 天允许没建完。
+    day_ends = [
         (round_no, missing)
         for round_no, missing in world.wall_holes_seen
-        if (round_no - 1) % ROUNDS_PER_DAY == ROUNDS_PER_DAY - 1 and missing
+        if (round_no - 1) % ROUNDS_PER_DAY == DAY_ROUNDS - 1
     ]
-    if night_ends:
-        problems.append(f"{label}: fence still broken at end of night {night_ends[:3]}")
+    late_holes = [
+        (round_no, missing)
+        for round_no, missing in day_ends
+        if missing and (round_no - 1) // ROUNDS_PER_DAY + 1 >= 2
+    ]
+    print(f"  每天收工缺口        : {day_ends}")
+    if late_holes:
+        problems.append(f"{label}: 白天收工仍有围墙缺口 {late_holes[:3]}")
     return problems
 
 

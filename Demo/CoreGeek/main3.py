@@ -15,9 +15,12 @@ from pathlib import Path
 
 
 def main() -> None:
-    # 判题器只会传一个参数：端口号
-    if len(sys.argv) != 2:
-        raise SystemExit("Usage: python main3.py <port>")
+    # 接口文档只说"样例：bash run.sh port""port 为系统启动时传给选手程序的端口号"，
+    # 它并没有承诺"只会传一个参数"。所以这里只校验"至少有一个"，多余的参数直接忽略：
+    # 万一判题器多传了参数，忽略它我们照样能跑；而如果为此退出进程，按任务书第八章
+    # "参赛代码异常退出后不再被拉起"，那就是直接 0 分。端口本身解析不了才应该报错。
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python main3.py <port> [extra args are ignored]")
     port = int(sys.argv[1])
 
     root = Path(__file__).resolve().parent
