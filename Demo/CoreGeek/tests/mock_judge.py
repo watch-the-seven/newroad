@@ -86,6 +86,14 @@ VENDOR_PRICES = {"stone": 1, "iron": 3, "copper": 5}
 
 # 机器人（HP, 攻击力），对应任务书 4.7.2 的表格；
 # 攻击距离统一为 3，mock 里简化成"必须先走到目标旁边才打"。
+#: 武器射程/血量随等级变化（任务书 4.5.1）。10**9 表示"全图"。
+TOWER_RANGE_BY_LEVEL = {
+    "gatling": (3, 5, 7),
+    "railgun": (6, 8, 10),
+    "rocket": (10, 15, 10 ** 9),
+}
+TOWER_MAX_HEALTH = {1: 1000, 2: 1500, 3: 2000}
+
 ROBOT_STATS = {
     "smallRobot": (40, 5),
     "middleRobot": (60, 10),
@@ -725,7 +733,22 @@ class World:
             return
         # 券名末位是目标等级：Voucher1 = level1->2，Voucher2 = level2->3
         variant = name[-1] if name[-1] in "12" else ""
-        if name.startswith("WallUpgradeVoucher"):
+        if name.startswith("WeaponUpgradeVoucher"):
+            # 武器升级券：站在目标武器周围一格内使用，等级必须匹配（1级用券1、2级用券2）
+            target = targets[0] if targets else None
+            tower = self.tower_at(target) if target else None
+            if tower is None or target is None or not self.adjacent(unit.pos, target):
+                self.rejected.append(f"r{round_no}: u{unit_id} {name} on {target} invalid")
+                return
+            want = 1 if variant == "1" else 2
+            if tower.level != want:
+                self.rejected.append(f"r{round_no}: u{unit_id} {name} on level {tower.level}")
+                return
+            tower.level += 1
+            tower.health = TOWER_MAX_HEALTH[tower.level]          # 升级回满血（任务书 4.6.3）
+            tower.attack_range = TOWER_RANGE_BY_LEVEL[tower.kind][tower.level - 1]
+            self.events.append(f"r{round_no} {tower.kind}@{target} 升到 {tower.level} 级")
+        elif name.startswith("WallUpgradeVoucher"):
             target = targets[0] if targets else None
             wall = self.walls.get(target) if target else None
             # 升级券需站在目标建筑周围一格内并指定目标位置（任务书 4.6.3 注）
@@ -745,12 +768,13 @@ class World:
             assert station is not None
             target = targets[0] if targets else None
             # 基地是 2x2，targetPos 落在它的任意一格上都算指向基地
-            if target is None or target not in station_footprint(Pos(*station.pos)):
+            if target is None or Pos(*target) not in station_footprint(Pos(*station.pos)):
                 self.rejected.append(f"r{round_no}: u{unit_id} {name} bad target {target}")
                 return
             # 需要在基地周围一格内使用
-            if not self.adjacent(unit.pos, station.pos):
-                self.rejected.append(f"r{round_no}: u{unit_id} {name} too far from station")
+            # 距离按"离 targetPos 指定的那一格"算（基地占 4 格，站哪边都该有效）
+            if not self.adjacent(unit.pos, target):
+                self.rejected.append(f"r{round_no}: u{unit_id} {name} too far from {target}")
                 return
             want = 1 if variant == "1" else 2
             if station.level != want:
@@ -813,6 +837,10 @@ class World:
         if self.active_point:
             self.task_cooldown[self.active_point] = 30
         self.events.append(f"r{round_no} submitAnswer {answer[:40]!r}")
+
+    def tower_at(self, pos: tuple[int, int]) -> MockUnit | None:
+        """按坐标找武器工事（升级券要指定 targetPos）。"""
+        return self.towers.get(pos)
 
     def tower_by_id(self, unit_id: int) -> MockUnit | None:
         """按 ID 找武器。

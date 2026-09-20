@@ -35,23 +35,34 @@ RIGHT = "right"
 #: 查表，避免用公式把脚本里 500→600 那个跳变拟合错。
 NIGHT_WALL_THRESHOLD = {4: 400, 5: 450, 6: 500, 7: 600, 8: 700, 9: 800, 10: 900}
 
-#: 白天各角色要买到手的围墙修补包数量（第 4 天 5 个 → 第 6 天起 10 个）。
-#: 语义是"库存目标"而不是"当天必须新买几个"：手里已经够了就不再买，
-#: 夜里用掉之后第二天会自然补货。
+#: 白天要买到手的围墙修补包数量（库存目标，不是"当天必须新买几个"）。
+#: 选手要求"多买点"：在原表（5/6/10）基础上翻倍，并且第 4 天就直接拉到 10 个——
+#: 夜间修墙是用量最大的时候，多囤点才扛得住多面墙同时被啃。
+#: 两个工人各囤一份（第 4 天 100 金/天，第 6 天起 200 金/天），受金币与背包余量限制。
 DAY_FIXER_PURCHASE = {
-    4: 5,
-    5: 6,
-    6: 10,
-    7: 10,
-    8: 10,
-    9: 10,
-    10: 10,
+    4: 10,
+    5: 12,
+    6: 20,
+    7: 20,
+    8: 20,
+    9: 20,
+    10: 20,
 }
 
-#: 第 1 天工人A挖石头的目标数量（挖满 20 再去建 16 面墙，留 4 块备用）
-STONE_TARGET_FIRST_DAY = 20
-#: 第 2/4 天工人A挖石头的目标数量（留着修补被打坏的墙）
-STONE_TARGET_REPAIR_DAY = 10
+#: 工人A的石头目标：第 1 天挖 10 块建"核心 10 面墙"，第 2 天挖 10 块建剩余 6 面
+STONE_TARGET_DAY1 = 10
+STONE_TARGET_DAY2 = 10
+#: 第 3 天起补墙时，石头不够就一次挖 10 块
+STONE_TARGET_REPAIR = 10
+
+#: 天黑前回位的余量（回合）：剩余白天回合 <= 到站位距离 + 该余量 时就开始回位。
+#: 取 6 而不是 3：围栏内侧走廊很窄，两个工人同时回位时会互相堵住（实测有 3 个回合
+#: 完全走不通），余量太小就会迟到、赶不上"黑夜开始前必须到位"。
+RECALL_MARGIN = 8
+#: 围墙升级券最早在白天第几个回合开始买（脚本口径：每个白天的第 50 回合）
+WALL_VOUCHER_FROM_ROUND = 50
+#: 开拓者只在白天前 50 个回合内下单（超过就当天不买，直接回攻击位）
+PIONEER_BUY_UNTIL_ROUND = 50
 
 
 def side_of(base: Pos) -> str:
@@ -70,7 +81,10 @@ class Layout:
     worker_a_stand: Pos                # 工人A第 1 天站这儿造 3 座火箭炮
     rockets: tuple[Pos, Pos, Pos]      # 3 座火箭炮的位置；顺序=建造顺序=夜间轮转开火顺序
     walls: tuple[Pos, ...]             # 围栏 16 格，按"顺时针绕一圈"排列
-    upgrade_walls: tuple[Pos, ...]     # 重点升级的 10 格（朝向敌人的那一侧）
+    core_walls: tuple[Pos, ...]        # 核心 10 面（第 1 天先建这批）
+    rest_walls: tuple[Pos, ...]        # 剩余 6 面（第 2 天补齐）
+    upgrade_walls: tuple[Pos, ...]     # 重点升级的 10 格，**已按升级顺序排好**：
+                                       # 先"同一条纵向线上的 6 面"，再剩下 4 面
     night_worker_a: Pos                # 第 4 天起夜间工人A的待命站位
     night_worker_b: Pos                # 第 4 天起夜间工人B的待命站位
 
@@ -110,11 +124,23 @@ def layout(base: Pos, side: str | None = None) -> Layout:
             ),
             # 只把这 10 格升到 3 级：右边一列 + 下边一排，即朝敌人（右下）的那一侧；
             # 剩下 6 格（上边左半 + 下边左半）保持 1 级。
+            # 升级顺序 = 先 x=x+3 这一整条纵向线上的 6 面（含上下两个角），
+            # 再剩下 4 面（上排左 2 + 下排左 2）
             upgrade_walls=(
+                Pos(x + 3, y + 2), Pos(x + 3, y + 1), Pos(x + 3, y),
+                Pos(x + 3, y - 1), Pos(x + 3, y - 2), Pos(x + 3, y - 3),
+                Pos(x + 1, y + 2), Pos(x + 2, y + 2),
+                Pos(x + 2, y - 3), Pos(x + 1, y - 3),
+            ),
+            core_walls=(
                 Pos(x + 1, y + 2), Pos(x + 2, y + 2), Pos(x + 3, y + 2),
                 Pos(x + 3, y + 1), Pos(x + 3, y), Pos(x + 3, y - 1),
                 Pos(x + 3, y - 2), Pos(x + 3, y - 3), Pos(x + 2, y - 3),
                 Pos(x + 1, y - 3),
+            ),
+            rest_walls=(
+                Pos(x - 2, y + 2), Pos(x - 1, y + 2), Pos(x, y + 2),
+                Pos(x, y - 3), Pos(x - 1, y - 3), Pos(x - 2, y - 3),
             ),
             night_worker_a=Pos(x + 2, y + 1),
             night_worker_b=Pos(x + 2, y - 2),
@@ -136,12 +162,22 @@ def layout(base: Pos, side: str | None = None) -> Layout:
             Pos(x + 3, y - 3), Pos(x + 2, y - 3), Pos(x + 1, y - 3),
             Pos(x, y - 3), Pos(x - 1, y - 3), Pos(x - 2, y - 3),
         ),
-        # 镜像版重点升级的是左边一列 + 下边一排（朝敌人左上/中部的那一侧）
+        # 镜像版：先 x=x-2 这条纵向线上的 6 面，再剩下 4 面
         upgrade_walls=(
+            Pos(x - 2, y + 2), Pos(x - 2, y + 1), Pos(x - 2, y),
+            Pos(x - 2, y - 1), Pos(x - 2, y - 2), Pos(x - 2, y - 3),
+            Pos(x, y + 2), Pos(x - 1, y + 2),
+            Pos(x - 1, y - 3), Pos(x, y - 3),
+        ),
+        core_walls=(
             Pos(x, y + 2), Pos(x - 1, y + 2), Pos(x - 2, y + 2),
             Pos(x - 2, y + 1), Pos(x - 2, y), Pos(x - 2, y - 1),
             Pos(x - 2, y - 2), Pos(x - 2, y - 3), Pos(x - 1, y - 3),
             Pos(x, y - 3),
+        ),
+        rest_walls=(
+            Pos(x + 1, y + 2), Pos(x + 2, y + 2), Pos(x + 3, y + 2),
+            Pos(x + 3, y - 3), Pos(x + 2, y - 3), Pos(x + 1, y - 3),
         ),
         night_worker_a=Pos(x - 1, y + 1),
         night_worker_b=Pos(x - 1, y - 2),
@@ -155,13 +191,17 @@ def layout(base: Pos, side: str | None = None) -> Layout:
 #:
 #: * ``("rockets",)``                    第 1 天到 station 旁建 3 座火箭炮
 #: * ``("stone", N)``                    挖石头到 N 块（当天配额，见 brain 里的闩）
-#: * ``("walls",)``                      把 16 格围栏里缺的补上（没石头就先去挖）
-#: * ``("upgrade",)``                    补墙 + 把 10 格重点墙升到 3 级（按等级自动选券）
-#: * ``("ore",)``                        挖最近的铁/铜，满 20 就去小贩卖掉
+#: * ``("walls", which)``                补墙；which = "core"(核心10) / "rest"(剩余6) / "all"(16)
+#: * ``("stock_fixers",)``               把围墙修补包补到当天目标；全满级后改为买到没钱
+#: * ``("wall_voucher",)``               买围墙升级券（有门限：武器全3级 + 第50回合起）
+#: * ``("upgrade",)``                    用手里的券升级 10 面核心墙（先6同列再4，不买）
+#: * ``("recall",)``                     第4天起：天黑前回夜间站位（优先级高于挖矿/购买）
+#: * ``("ore",)``                        挖最近的铁/铜；白天任一种到 10 就去清仓，夜里只挖不卖
 #: * ``("buy", 物品, N)``                买到手 N 个（钱不够就少买）
-#: * ``("stance",)``                     开拓者走到站位（被占就用备选）
+#: * ``("stance",)``                     开拓者走到攻击位（被占就用备选）
 #: * ``("tasks",)``                      开拓者做自进化任务（状态机在 taskflow.py）
-#: * ``("station_voucher",)``            备一张基地升级券 1（基地还是 1 级且钱够时）
+#: * ``("pioneer_buy",)``                开拓者每天最多买一次（按优先级挑物品）
+#: * ``("use_vouchers",)``               开拓者用手里的券升级武器/基地
 #: * ``("guard",)``                      夜间：基地危急就用券，否则操控火箭炮开火
 #:
 #: * ``("night_repair",)``               第 4 天起夜间：用围墙修补包修墙，否则回站位
@@ -178,76 +218,83 @@ Step = tuple[Any, ...]
 
 
 def worker_a_plan(day: int, is_day: bool, side: str) -> tuple[Step, ...]:
-    """工人A（编号较小的那个工人）当天的步骤表。"""
+    """工人A（编号较小的那个工人）当天的步骤表。
+
+    第 1 天：挖 10 石 → 建**核心 10 面**墙 → 挖矿
+    第 2 天：挖 10 石 → 建**剩余 6 面**墙 → 挖矿
+    第 3 天起：回位（第4天起）→ 备修补包 → 补被打空的墙 → 买围墙券（有门限）
+              → 升级 10 面（6 同列 + 4）→ 挖矿
+    """
     if not is_day:
+        # 夜里不能建造围墙（任务书 4.4），但可以用围墙修补包修墙（use 无昼夜限制）。
+        # 第 1~3 天夜里只挖矿；第 4 天起夜里改为"修墙或回站位待命"。
         if day <= 3:
-            # 夜里**不能建造**围墙（任务书 4.4：build 仅工人在白天可用），
-            # 所以第 1~3 天夜里只挖矿卖矿；第 1 天没建完的墙留到第 2 天白天补。
             return (("ore",),)
-        # 第 4 天起：夜里拿围墙修补包把掉血到阈值以下的墙补满——修补包走的是
-        # `use`，没有昼夜限制，夜里可以正常用；没有要修的墙就回夜间站位待命。
-        # 注意夜里**不建造**围墙（洞口只能等第二天白天重建）。
         return (("night_repair",),)
 
     if day == 1:
-        # 造炮（3*25=75 金，正好是初始金币）→ 挖 20 石头 → 建 16 面墙 → 挖矿卖钱
+        # 先造 3 座火箭炮（3*25=75 金，正好是初始金币），再挖 10 石建核心 10 面墙
         return (
             ("rockets",),
-            ("stone", STONE_TARGET_FIRST_DAY),
-            ("walls",),
+            ("stone", STONE_TARGET_DAY1),
+            ("walls", "core"),
             ("ore",),
         )
     if day == 2:
-        # 挖 10 石头备修 → 买券把 10 格重点墙升到 2 级 → 挖矿卖钱
         return (
-            ("stone", STONE_TARGET_REPAIR_DAY),
-            ("upgrade",),
+            ("stone", STONE_TARGET_DAY2),
+            ("walls", "rest"),
             ("ore",),
         )
-    if day == 3:
-        # 只做升级：把 10 格重点墙从 2 级升到 3 级（有洞就先补）
-        return (("upgrade",),)
-    if day == 4:
-        # 补洞 → 挖 10 石头 → 升级/修补 → 额外买 5 个围墙修补包
-        return (
-            ("stone", STONE_TARGET_REPAIR_DAY),
-            ("upgrade",),
-            ("buy", WALL_FIXER, DAY_FIXER_PURCHASE[4]),
-        )
-    # 第 5..10 天：补洞 → 备修补包 → 升级（若有 1/2 级墙）→ 剩下的时间挖矿卖钱
+    # 第 3 天起
     return (
-        ("walls",),
-        ("buy", WALL_FIXER, DAY_FIXER_PURCHASE.get(day, 10)),
+        ("recall",),          # 第 4 天起生效：天黑前必须回到夜间站位（优先级最高）
+        # 用手里已有的券升级：不占购物往返、就在基地旁，早上先干完最划算
+        # （放后面会被"跑商店买修补包"整个吃掉白天，实测墙升级会拖到第 10 天）
         ("upgrade",),
+        ("stock_fixers",),    # 购买优先级：修补包 > 围墙升级券
+        ("walls", "all"),     # 16 面里被打空的补上
+        ("wall_voucher",),    # 再按"能不能在天黑前赶回来"去商店补券
         ("ore",),
     )
 
 
 def worker_b_plan(day: int, is_day: bool, side: str) -> tuple[Step, ...]:
-    """工人B当天的步骤表：白天第 4 天起先备修补包再挖矿；夜里一律只挖矿。"""
+    """工人B：白天"回位 → 备修补包 → 挖矿"，夜里同工人A（前3天挖矿、之后修墙）。"""
     if not is_day:
-        # 同工人A：前 3 天夜里挖矿卖矿，第 4 天起夜里负责用修补包修墙
         if day <= 3:
             return (("ore",),)
         return (("night_repair",),)
 
-    fixers = DAY_FIXER_PURCHASE.get(day, 0)
-    if fixers:
-        return (("buy", WALL_FIXER, fixers), ("ore",))
-    return (("ore",),)
+    return (
+        ("recall",),
+        ("stock_fixers",),
+        ("ore",),
+    )
 
 
 def pioneer_plan(day: int, is_day: bool, side: str) -> tuple[Step, ...]:
-    """开拓者当天的步骤表：前 3 天做任务，第 4 天起原地待命（脚本要求"保持不动"）。"""
+    """开拓者：白天做任务（仅前3天）→ 每天最多买一次 → 去攻击位升级武器 → 待命。
+
+    * 夜里只负责"基地危急时用基地升级券 + 操控火箭炮开火"；
+    * 白天前 3 天先做两个自进化任务，再做购买；
+    * 购买由 ``_step_pioneer_buy`` 按优先级决定：武器升级券 > 基地升级券1（第6天起）
+      > 基地升级券2（10 面墙全 3 级后）；超过第 50 回合就当天不买。
+    """
     if not is_day:
-        if day <= 3:
-            # 前 3 天夜里顺带把基地升级券买上（钱够的话），然后进入战位开火
-            return (("station_voucher",), ("guard",))
         return (("guard",),)
 
+    # ``("recall",)`` 放最前：只要发现"再不往回赶就赶不上了"，就立刻中止任务/购物回开火位。
+    # 开拓者**每一天**都需要回位（工人只从第 4 天起需要）——"黑夜开始必须在炮位上"。
     if day <= 3:
-        return (("tasks",), ("station_voucher",), ("stance",))
-    return (("stance",),)
+        return (
+            ("recall",),
+            ("tasks",),
+            ("pioneer_buy",),
+            ("use_vouchers",),
+            ("stance",),
+        )
+    return (("recall",), ("pioneer_buy",), ("use_vouchers",), ("stance",))
 
 
 def night_wall_threshold(day: int) -> int:

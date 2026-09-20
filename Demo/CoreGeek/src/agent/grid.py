@@ -7,6 +7,7 @@ A*（启发函数取切比雪夫距离，与移动代价一致）算"下一步�
 返回 ``None`` 表示这一回合到不了（被堵死/目标不可达），调用方应当放弃或换目标。
 """
 
+from collections import deque
 from heapq import heappop, heappush
 from itertools import count
 
@@ -21,15 +22,23 @@ _STEPS = (
 )
 
 
-def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
+def next_step(
+    turn: Turn,
+    moving: Unit,
+    goal: Pos,
+    extra_blocked: frozenset[Pos] = frozenset(),
+) -> Pos | None:
     """返回 ``moving`` 朝 ``goal`` 前进一格后的坐标；不可达则返回 ``None``。
 
     障碍来源统一由 ``Turn.blocked()`` 给出：中立区域（矿区/小贩/武器商店/
     任务点）、场上所有单位、机器人、可见敌方单位。注意它会排除 ``moving``
     自己所在格，否则自己会被当成障碍。
+
+    ``extra_blocked`` 是调用方额外指定的禁行格（例如夜间"机器人周围两格内
+    不许站"的安全区），只影响寻路，不影响"能不能站"的其他判断。
     """
     # 一次性取出障碍集合，后面的循环里反复用，避免每步重算
-    blocked = turn.blocked(moving)
+    blocked = turn.blocked(moving) | extra_blocked
     # 堆的第三关键字用自增序号，保证同优先级(F值)时弹出顺序稳定、可复现
     order = count()
     # 优先队列元素：(F=已走步数+启发值, G=已走步数, 序号, 坐标)
@@ -69,6 +78,48 @@ def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
                 ),
             )
     # 队列空了还没到目标：目标被围死或根本不可达
+    return None
+
+
+def path_length(
+    turn: Turn,
+    moving: Unit,
+    goal: Pos,
+    extra_blocked: frozenset[Pos] = frozenset(),
+) -> int | None:
+    """从 ``moving.pos`` 走到 ``goal`` 需要几步（8 邻域 BFS）；不可达返回 ``None``。
+
+    与 ``next_step`` 共用同一套障碍判定。用途：判断"现在往回赶还来不来得及"——
+    直线距离会被墙骗（围栏有开口，直线 2 格可能实际要绕 8 步）。
+    """
+    if moving.pos == goal:
+        return 0
+    return path_from(turn, moving.pos, goal, turn.blocked(moving) | extra_blocked)
+
+
+def path_from(
+    turn: Turn, start: Pos, goal: Pos, blocked: frozenset[Pos] = frozenset()
+) -> int | None:
+    """从任意起点 ``start`` 到 ``goal`` 的最短步数；不可达返回 None。
+
+    用来估算"从商店回站位要几步"这类问题（起点不是角色当前位置）。
+    """
+    if start == goal:
+        return 0
+    queue = deque([(start, 0)])
+    seen = {start}
+    while queue:
+        current, dist = queue.popleft()
+        for dx, dy in _STEPS:
+            step = Pos(current.x + dx, current.y + dy)
+            if step in seen:
+                continue
+            if step == goal:            # 目标本身可能被占，仍然算"到得了"
+                return dist + 1
+            if step in blocked or not turn.land(step):
+                continue
+            seen.add(step)
+            queue.append((step, dist + 1))
     return None
 
 

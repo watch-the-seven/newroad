@@ -42,8 +42,8 @@ IRON = "iron"
 COPPER = "copper"
 ORES = (STONE, IRON, COPPER)
 MINE_KINDS = (STONE, IRON, COPPER)
-ORE_SELL_THRESHOLD = 20  # 铜+铁**合计**攒够 20 就到小贩处清空背包
-                         # （与口述脚本"单一矿种 20"的差异见 README 偏差清单）
+ORE_SELL_THRESHOLD = 10  # 背包里**任一种**矿（铜或铁）到 10 个就去小贩处
+                         # 触发后把铜和铁一起卖光（sell 一次只能卖一种，见接口文档 2.2）
 
 #: roleType 取值（接口文档 1.3.1）
 STATION = "station"
@@ -88,6 +88,11 @@ ROBOT_PRIORITY = {
 }
 
 #: 武器射程随等级变化（任务书 4.5.1）。火箭 3 级是全图，用一个大数表示。
+#: 夜间挖矿的安全距离：工人不得进入机器人周围 N-1 格内（不得接近"两格内"）。
+#: 注意机器人攻击距离是 3 格（任务书 4.7.2），所以这个值只满足选手的字面要求，
+#: 并不保证"绝对打不到"——真要绝对安全需要 >=4。
+NIGHT_SAFE_DISTANCE = 3
+
 TOWER_RANGE_BY_LEVEL = {
     "gatling": (3, 5, 7),
     "railgun": (6, 8, 10),
@@ -393,6 +398,11 @@ class Turn:
                 if item.get("name")
             },
         )
+
+    @property
+    def round_in_day(self) -> int:
+        """当天的第几回合（0..129）。白天 0..69，黑夜 70..129（任务书 4.2）。"""
+        return (self.round_no - 1) % ROUNDS_PER_DAY
 
     # -- 单位查询 ----------------------------------------------------------
     def alive(self, kinds: Sequence[str]) -> tuple[Unit, ...]:

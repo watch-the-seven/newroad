@@ -32,13 +32,18 @@ from collections import Counter
 from typing import Any, Sequence
 
 from . import tactics
-from .grid import next_step
+from .grid import next_step, path_from, path_length
 from .roundlog import RECORDER as ROUND_LOG
 from .protocol import (
     COPPER,
+    DAY_ROUNDS,
+    PIONEER,
+    Robot,
     IRON,
+    NIGHT_SAFE_DISTANCE,
     ORE_SELL_THRESHOLD,
     STATION_VOUCHER1,
+    STATION_VOUCHER2,
     STONE,
     Pos,
     Turn,
@@ -49,6 +54,7 @@ from .protocol import (
     WALL_MAX_HEALTH,
     WALL_VOUCHER,
     WEAPON_BUILD_COST,
+    WEAPON_VOUCHER,
     WEAPON_SHOP,
     attack_command,
     build_command,
@@ -70,6 +76,25 @@ LOGGER = logging.getLogger(__name__)
 #: 阈值来自脚本："当基地血量小于 500 时使用基地升级卷1"。
 STATION_EMERGENCY_HEALTH = 500
 
+#: 火箭单发中心伤害（任务书 4.5.1：火箭攻击力 20*等级，即每枚导弹 20）
+#: 去商店买围墙券的往返安全余量（回合）
+VOUCHER_TRIP_SLACK = 2
+#: 升级链保留金：升级链（墙券 + 基地券）没走完之前，别把金币全砸在围墙修补包上，
+#: 否则墙与基地会停在低等级——1 级墙 1000 血 vs 3 级 2000 血，对"活着"是反向的。
+#: 开拓者的回位余量：它离开火位只有几步、路线也短（不像工人要绕围栏开口），
+#: 用工人那套 8 回合余量会白扔一大截白天（实测会把墙/基地升级链挤垮）。
+PIONEER_RECALL_MARGIN = 3
+#: 设为 0 表示不保留（修补包优先到底）。
+#: 取 400 是实测出来的甜点：修补包能囤到 20~30 个（原表只有 12~20），而且升级链
+#: 反而更早完成（墙全 3 级 @682 回合 vs 原表 @930）——因为不再把金币全压在包里。
+FIXER_CHAIN_RESERVE = 400
+#: 火箭单发中心伤害（任务书 4.5.1：火箭攻击力 20*等级，即每枚导弹 20）
+DAMAGE_PER_MISSILE = 20
+#: 非火箭武器在 mock/正式接口里的单发伤害（加特林 10、电磁按能量，这里保守取 10）
+DAMAGE_OTHER_WEAPON = 10
+#: 开拓者只打"自己这一边"的机器人：|基地y - 机器人y| <= 这个值（选手要求 9）
+OUR_SIDE_Y_SPAN = 9
+
 #: ``decide()`` 全程持锁：HTTP 服务是多线程的，而 MatchState 是全局可变状态。
 _LOCK = threading.Lock()
 
@@ -88,9 +113,11 @@ class MatchState:
         self.worker_ids: dict[str, int] = {}               # {"A": 工人A的ID, "B": 工人B的ID}
         # 已挖够当日石头配额的 (天, 单位ID)，避免"建一面墙花掉石头后又跑回去挖"
         self.stone_quota: set[tuple[int, int]] = set()
-        # 正在清仓的工人ID：合计到 20 后要把背包里的铜和铁全部卖光（一回合一种）。
-        # 需要它是因为卖掉第一种后"合计"就掉到 20 以下了，光看合计会漏掉第二种。
+        # 正在清仓的工人ID：任一种矿到 10 后要把背包里的铜和铁全部卖光（一回合一种）。
+        # 需要它是因为卖掉第一种后"任一种到 10"可能不再成立，光看阈值会漏掉第二种。
         self.sell_pending: set[int] = set()
+        # 已经"下过单/放弃下单"的 (天, 单位ID)：开拓者每天最多买一次
+        self.daily_purchase: set[tuple[int, int]] = set()
 
     def sync(self, turn: Turn) -> None:
         """每回合开头调用：识别新一局、锁定布局与工人编号。"""
@@ -328,17 +355,27 @@ def _apply_step(
     if kind == "stone":
         return _step_stone(turn, state, role, int(step[1]), claimed, latch=True)
     if kind == "walls":
-        return _step_walls(turn, state, role, layout, claimed)
+        return _step_walls(
+            turn, state, role, layout, claimed, str(step[1]) if len(step) > 1 else "all"
+        )
     if kind == "upgrade":
         return _step_upgrade(turn, state, role, layout, claimed)
+    if kind == "wall_voucher":
+        return _step_wall_voucher(turn, state, role, layout, claimed)
+    if kind == "stock_fixers":
+        return _step_stock_fixers(turn, state, role, layout, claimed)
+    if kind == "recall":
+        return _step_recall(turn, state, role, layout, claimed)
     if kind == "ore":
         return _step_ore(turn, state, role, claimed)
     if kind == "buy":
         return _step_buy(turn, role, str(step[1]), int(step[2]), claimed)
     if kind == "stance":
         return _step_stance(turn, role, layout, claimed)
-    if kind == "station_voucher":
-        return _step_station_voucher(turn, role, claimed)
+    if kind == "pioneer_buy":
+        return _step_pioneer_buy(turn, state, role, layout, claimed)
+    if kind == "use_vouchers":
+        return _step_use_vouchers(turn, state, role, layout, claimed)
     if kind == "tasks":
         # 任务流水线自带状态，直接把移动能力（_goto_adjacent）借给它用
         return state.task.drive(turn, role, claimed, _goto_adjacent)
@@ -362,7 +399,11 @@ def _adjacent(origin: Pos, target: Pos) -> bool:
 
 
 def _goto_exact(
-    turn: Turn, role: Unit, target: Pos, claimed: set[Pos]
+    turn: Turn,
+    role: Unit,
+    target: Pos,
+    claimed: set[Pos],
+    extra: frozenset[Pos] = frozenset(),
 ) -> dict[str, Any] | None:
     """朝"精确站到 target 格"走一步。
 
@@ -372,9 +413,9 @@ def _goto_exact(
     """
     if role.pos == target:
         return None
-    if not turn.free(target, role):
+    if not turn.free(target, role) or target in extra:
         return None
-    step = next_step(turn, role, target)
+    step = next_step(turn, role, target, extra)
     if step is None or step in claimed:
         return None
     claimed.add(step)
@@ -387,6 +428,7 @@ def _goto_adjacent(
     targets: Sequence[Pos],
     claimed: set[Pos],
     radius: int = 1,
+    extra: frozenset[Pos] = frozenset(),
 ) -> dict[str, Any] | None:
     """朝"站到任意 target 周围 ``radius`` 格内"走一步。
 
@@ -409,16 +451,87 @@ def _goto_adjacent(
             if stand == role.pos:
                 return None
             # 不可站：不是空地、被单位/机器人占着、或同回合已被别人预定
-            if not turn.land(stand) or stand in blocked or stand in claimed:
+            if not turn.land(stand) or stand in blocked or stand in claimed or stand in extra:
                 continue
             stands.append((distance(role.pos, stand), stand.x, stand.y, stand))
     stands.sort(key=lambda item: item[:3])  # 就近优先，同距离按坐标稳定排序
     for _, _, _, stand in stands:
-        step = next_step(turn, role, stand)
+        step = next_step(turn, role, stand, extra)
         if step is not None and step not in claimed:
             claimed.add(step)
             return move_command(step)
     return None
+
+
+# --------------------------------------------------------------------------
+# 夜间安全（选手要求：夜里挖矿不得接近机器人两格内，绝不能被机器人打死）
+# --------------------------------------------------------------------------
+def _danger_cells(turn: Turn) -> frozenset[Pos]:
+    """夜间禁区：机器人周围 ``NIGHT_SAFE_DISTANCE - 1`` 格内的所有格子。
+
+    注意机器人攻击距离是 3 格（任务书 4.7.2），所以按选手字面要求的"两格"建禁区
+    并不能保证绝对打不到；这是**遵从选手口径**的实现，真要绝对安全应改成 >=4。
+    """
+    cells: set[Pos] = set()
+    for robot in turn.robots:
+        if robot.health <= 0:
+            continue
+        cells.add(robot.pos)
+        cells.update(cells_within(robot.pos, NIGHT_SAFE_DISTANCE - 1))
+    return frozenset(cells)
+
+
+def _mine_is_safe(turn: Turn, mine: Pos, danger: frozenset[Pos]) -> bool:
+    """这个矿值不值得挖：至少要有一个相邻格不在禁区里（否则站过去就挨打）。"""
+    return any(
+        turn.land(cell) and cell not in danger for cell in cells_within(mine, 1)
+    )
+
+
+def _retreat(
+    turn: Turn, role: Unit, claimed: set[Pos], danger: frozenset[Pos], radius: int = 4
+) -> dict[str, Any] | None:
+    """从禁区里撤出来（已经被机器人逼近时的保命动作）。"""
+    stands = [
+        cell
+        for cell in cells_within(role.pos, radius)
+        if turn.land(cell)
+        and cell not in turn.blocked(role)
+        and cell not in danger
+        and cell not in claimed
+    ]
+    stands.sort(key=lambda cell: (distance(role.pos, cell), cell.x, cell.y))
+    for stand in stands:
+        move = _goto_exact(turn, role, stand, claimed)
+        if move is not None:
+            return move
+    return None
+
+
+# --------------------------------------------------------------------------
+# 满级判定（决定"只买修补包"和"开始买围墙券"的时机）
+# --------------------------------------------------------------------------
+def _weapons_maxed(turn: Turn) -> bool:
+    """3 座武器是否都已到 3 级。"""
+    weapons = turn.weapons()
+    return len(weapons) >= 3 and all(tower.level >= 3 for tower in weapons)
+
+
+def _core_walls_maxed(turn: Turn, layout: tactics.Layout) -> bool:
+    """核心 10 面墙是否都已到 3 级。"""
+    for pos in layout.core_walls:
+        wall = turn.wall_at(pos)
+        if wall is None or wall.level < 3:
+            return False
+    return True
+
+
+def _everything_maxed(turn: Turn, layout: tactics.Layout) -> bool:
+    """武器 + 核心墙 + 基地 是否全部到 3 级（之后每天只买修补包）。"""
+    station = turn.station()
+    if station is None or station.level < 3:
+        return False
+    return _weapons_maxed(turn) and _core_walls_maxed(turn, layout)
 
 
 # --------------------------------------------------------------------------
@@ -499,20 +612,34 @@ def _buildable(turn: Turn, pos: Pos, claimed: set[Pos]) -> bool:
 
 
 def _step_walls(
-    turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout, claimed: set[Pos]
+    turn: Turn,
+    state: MatchState,
+    role: Unit,
+    layout: tactics.Layout,
+    claimed: set[Pos],
+    which: str = "all",
 ) -> Any:
-    """把 16 格围栏里缺的格子补上（被拆掉的墙也算"缺"）。
+    """把围栏里缺的格子补上（被拆掉的墙也算"缺"）。
 
-    石头用光时会先回去挖（一次挖够"剩余缺墙数"，上限 20），
+    ``which`` 指定补哪一批：``"core"`` 核心 10 面（第 1 天）、``"rest"`` 剩余 6 面
+    （第 2 天）、``"all"`` 全部 16 面（第 3 天起补被打空的）。
+
+    石头用光时会先回去挖（一次挖够"剩余缺墙数"，上限 10），
     形成"挖一批 → 建一批"的循环，而不是建一面挖一块。
     """
-    missing = [pos for pos in layout.walls if turn.wall_at(pos) is None]
+    positions = {
+        "core": layout.core_walls,
+        "rest": layout.rest_walls,
+        "all": layout.walls,
+    }.get(which, layout.walls)
+    missing = [pos for pos in positions if turn.wall_at(pos) is None]
     if not missing:
         return None
     if role.count(STONE) <= 0:
-        # latch=False：这是应急挖矿，不受"当天已挖够 20 块"的闩限制
+        # latch=False：这是应急挖矿，不受"当天已挖够"的闩限制
         return _step_stone(
-            turn, state, role, min(20, len(missing)), claimed, latch=False
+            turn, state, role, min(tactics.STONE_TARGET_REPAIR, len(missing)), claimed,
+            latch=False,
         )
     missing.sort(key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
     for pos in missing:
@@ -555,24 +682,20 @@ def _pending_wall_work(turn: Turn, layout: tactics.Layout) -> list[tuple[Pos, st
 def _step_upgrade(
     turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout, claimed: set[Pos]
 ) -> Any:
-    """围栏作业总入口：先把 16 格补全，再把 10 格重点墙推到 3 级。
+    """用手里的券升级核心 10 面墙（**不负责购买**，购买在 _step_wall_voucher）。
 
-    三步优先级：① 补缺墙 → ② 用手里的券/修补包干活 → ③ 没钱没货就去买。
-    每回合都会重来一遍，所以"钱不够先少买、攒够了再买"是自然发生的。
+    顺序严格按 ``layout.upgrade_walls``：先"同一条纵向线上的 6 面"，再剩下 4 面。
+    1 级墙用券 1、2 级墙用券 2、3 级但掉血用修补包；升级会回满血（任务书 4.6.3）。
     """
-    # ① 围栏有洞就先补（脚本：16 个地方都有城墙后才谈升级）
-    if any(turn.wall_at(pos) is None for pos in layout.walls):
-        outcome = _step_walls(turn, state, role, layout, claimed)
-        if outcome is not None:
-            return outcome
-
     pending = _pending_wall_work(turn, layout)
     if not pending:
         return None
-
-    # ② 手里已经有的物品，按"离自己最近"的顺序用掉
     ordered = sorted(
-        pending, key=lambda item: (distance(role.pos, item[0]), item[0].x, item[0].y)
+        pending,
+        key=lambda item: (
+            layout.upgrade_walls.index(item[0]) if item[0] in layout.upgrade_walls else 99,
+            distance(role.pos, item[0]),
+        ),
     )
     for pos, item in ordered:
         if role.count_ci(item) <= 0:
@@ -583,65 +706,177 @@ def _step_upgrade(
         move = _goto_adjacent(turn, role, (pos,), claimed)
         if move is not None:
             return (role.unit_id, move)
+    return None
 
-    # ③ 没有现货：统计还缺哪种券/包，去买能买得起的那一批（优先缺得多的物品）
-    need = Counter(item for _, item in pending)
-    for item, count in sorted(need.items(), key=lambda kv: (-kv[1], kv[0])):
-        price = turn.price(item)
-        if price <= 0:          # 商店清单里没有这个物品，跳过
+
+def _trip_time_ok(
+    turn: Turn, role: Unit, layout: tactics.Layout, state: MatchState, shop: Pos
+) -> bool:
+    """现在去商店买东西，还来不来得及在天黑前回到夜间站位？
+
+    第 4 天起"黑夜开始前必须在指定位置"优先级高于购买，所以来不及就不去——
+    否则会在半路被召回接管，停在离站位好几格的地方（实测就是这样）。
+    """
+    if turn.day < 4:
+        return True
+    stance = (
+        layout.night_worker_a
+        if _worker_label(state, role, turn.workers()) == "A"
+        else layout.night_worker_b
+    )
+    to_shop = path_length(turn, role, shop)
+    back = path_from(turn, shop, stance, turn.blocked())
+    if to_shop is None or back is None:
+        return False
+    remaining = DAY_ROUNDS - turn.round_in_day
+    return remaining >= to_shop + 1 + back + tactics.RECALL_MARGIN
+
+
+def _step_stock_fixers(
+    turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout, claimed: set[Pos]
+) -> Any:
+    """备围墙修补包（优先级高于围墙升级券）。
+
+    * 平时：补到当天的库存目标（第4天5个、第5天6个、第6天起10个）；
+    * 武器/围墙/基地全满级后：每天只买修补包，**买到没钱**（受金币与背包余量限制）。
+    """
+    shop = turn.nearest_zone(role.pos, WEAPON_SHOP)
+    if shop is not None and not _trip_time_ok(turn, role, layout, state, shop):
+        return None                       # 来不及往返：位置优先，今天不补货
+    if _everything_maxed(turn, layout):
+        # 全满级后没有别的开销了：修补包买到没钱为止
+        return _step_buy(turn, role, WALL_FIXER, 99, claimed, absolute=True)
+    target = tactics.DAY_FIXER_PURCHASE.get(turn.day, 0)
+    if target <= 0:
+        return None
+    # 链没走完前留出保留金，避免墙/基地停在低等级（见 FIXER_CHAIN_RESERVE 注释）
+    return _step_buy(
+        turn,
+        role,
+        WALL_FIXER,
+        target,
+        claimed,
+        gold_limit=turn.gold - FIXER_CHAIN_RESERVE,
+    )
+
+
+def _step_wall_voucher(
+    turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout, claimed: set[Pos]
+) -> Any:
+    """买围墙升级券。两个门限（选手要求）：
+
+    1. **武器全部升到 3 级之后**才开始；
+    2. 只在**白天第 50 回合起**下单。
+
+    买券 1 还是券 2 由"还剩哪些墙没升"决定，一次买够差量（钱不够就少买）。
+    """
+    if not _weapons_maxed(turn):
+        return None
+    pending = _pending_wall_work(turn, layout)
+    need = Counter(
+        item
+        for _, item in pending
+        if item in (WALL_VOUCHER[1], WALL_VOUCHER[2])
+    )
+    if not need:
+        return None
+
+    stance = (
+        layout.night_worker_a
+        if _worker_label(state, role, turn.workers()) == "A"
+        else layout.night_worker_b
+    )
+    shop = turn.nearest_zone(role.pos, WEAPON_SHOP)
+    if shop is None:
+        return None
+    at_shop = _adjacent(role.pos, shop) and role.pos != shop
+
+    # 动身时刻 = "第 50 回合" 与 "最晚还能赶回来的时刻" 取较早的那个。
+    # 原因：第 50 回合后只剩 20 回合，而"站位→商店→买→回站位"实测要 26+ 回合，
+    # 死守第 50 回合会导致一整张券都买不到（墙与基地永远停在 1 级）。
+    to_shop = 0 if at_shop else path_length(turn, role, shop)
+    back = path_from(turn, shop, stance, turn.blocked())
+    if to_shop is None or back is None:
+        return None
+    remaining = DAY_ROUNDS - turn.round_in_day
+    trip = to_shop + 1 + back             # 去商店 + 买一次 + 回站位
+    if (
+        turn.round_in_day < tactics.WALL_VOUCHER_FROM_ROUND
+        # 关键：动身门限必须把"回位余量"一起算进去，否则会在召回接管的同一回合
+        # 才动身，买不到（实测 r48 动身、r48 就被召回接管）。
+        and remaining > trip + tactics.RECALL_MARGIN + VOUCHER_TRIP_SLACK
+    ):
+        return None                       # 还早：继续挖矿，等最晚动身时刻
+    if remaining < trip:
+        return None                       # 连往返都来不及：老老实实回位（站位优先）
+
+    for item, count in sorted(need.items(), key=lambda kv: (kv[0], -kv[1])):
+        short = count - role.count_ci(item)
+        if short <= 0:
             continue
-        affordable = min(count, turn.gold // price)   # 钱不够就少买
-        if affordable <= 0:
-            continue
-        outcome = _step_buy(turn, role, item, affordable, claimed, absolute=True)
+        outcome = _step_buy(turn, role, item, short, claimed, absolute=True)
         if outcome is not None:
             return outcome
     return None
 
 
 def _step_ore(turn: Turn, state: MatchState, role: Unit, claimed: set[Pos]) -> Any:
-    """挖矿主线：铜+铁合计满 20 就去小贩处清空背包，否则挖最近的铁/铜。
+    """挖矿主线。
 
-    卖矿规则（与脚本口径的差异见 README 偏差清单）：
-    * 触发条件是 **铜 + 铁 合计 >= 20**，而不是"某一种到 20"；
-    * 触发后把背包里的铜和铁**全部卖光**：一回合只能卖一种矿（接口的
-      ``sell`` 只接受单个 ``name``，见接口文档 2.2/2.3），所以
-      "只有一种"就 1 回合卖完，"两种都有"就 2 回合卖完；
-    * ``state.sell_pending`` 记录"正在清仓"：卖掉第一种后合计会掉到 20 以下，
-      没有这个标记就会漏卖第二种。
+    **白天**：背包里任一种矿（铜或铁）到 10 个，就去小贩处把铜与铁**全部卖光**
+    （sell 一次只能卖一种，所以两种都有时要两回合；``sell_pending`` 记住清仓状态）。
+    石头完全不参与卖矿。
 
-    石头完全不参与卖矿（它只用于砌墙/补墙），只有背包真满时的兜底才会清石头。
+    **夜里**：只挖不卖（选手要求，且优先于上面的阈值），并且只在"安全矿"上挖——
+    工人不得进入机器人周围 ``NIGHT_SAFE_DISTANCE-1`` 格内，寻路也会绕开禁区；
+    如果已经被逼近，先撤到安全格；没有安全矿就停手不挖（绝不冒险被打死）。
     """
-    copper = role.count(COPPER)
-    iron = role.count(IRON)
-    total = copper + iron
-    clearing = role.unit_id in state.sell_pending
-    if clearing and total == 0:          # 已经清空了，结束清仓状态
-        state.sell_pending.discard(role.unit_id)
-        clearing = False
+    danger = frozenset() if turn.is_day else _danger_cells(turn)
 
-    # 1) 该卖矿了：合计到阈值，或正在清仓途中
-    if total > 0 and (clearing or total >= ORE_SELL_THRESHOLD):
-        if not clearing:
-            state.sell_pending.add(role.unit_id)   # 进入清仓：接下来要把铜铁都卖掉
-        ore, amount = (COPPER, copper) if copper else (IRON, iron)   # 铜先（单价 5 > 铁 3）
-        outcome = _step_sell(turn, role, ore, amount, claimed)
-        if outcome is not None:
-            return outcome
+    # ---- 卖矿（只发生在白天）----
+    if turn.is_day:
+        copper, iron = role.count(COPPER), role.count(IRON)
+        total = copper + iron
+        clearing = role.unit_id in state.sell_pending
+        if clearing and total == 0:            # 清仓完成
+            state.sell_pending.discard(role.unit_id)
+            clearing = False
+        if total > 0 and (
+            clearing
+            or copper >= ORE_SELL_THRESHOLD
+            or iron >= ORE_SELL_THRESHOLD
+        ):
+            if not clearing:
+                state.sell_pending.add(role.unit_id)   # 进入清仓：铜铁都要卖掉
+            ore, amount = (COPPER, copper) if copper else (IRON, iron)   # 铜先（单价高）
+            outcome = _step_sell(turn, role, ore, amount, claimed)
+            if outcome is not None:
+                return outcome
 
-    # 2) 背包满了（100 格）就清仓，石头放最后——它是建墙/修墙的材料，尽量留着
+    # ---- 背包满 ----
     if role.backpack_full:
-        for ore in (COPPER, IRON, STONE):
-            amount = role.count(ore)
-            if amount:
-                outcome = _step_sell(turn, role, ore, amount, claimed)
-                if outcome is not None:
-                    return outcome
+        if turn.is_day:
+            for ore in (COPPER, IRON, STONE):   # 石头放最后（砌墙材料）
+                amount = role.count(ore)
+                if amount:
+                    outcome = _step_sell(turn, role, ore, amount, claimed)
+                    if outcome is not None:
+                        return outcome
+        return WAIT      # 夜里没得卖：停手，别硬挖
 
-    # 3) 挖最近的铁/铜；距离相同时优先铜（单价高）
+    # ---- 夜间保命：已经在禁区里就先撤 ----
+    if danger and role.pos in danger:
+        move = _retreat(turn, role, claimed, danger)
+        if move is not None:
+            return (role.unit_id, move)
+        return WAIT
+
+    # ---- 选矿 ----
     mines = [pos for pos in turn.mine_positions((IRON, COPPER)) if pos not in claimed]
+    if danger:
+        mines = [pos for pos in mines if _mine_is_safe(turn, pos, danger)]
     if not mines:
-        return None
+        return WAIT if danger else None
     mines.sort(
         key=lambda pos: (
             distance(role.pos, pos),
@@ -654,7 +889,7 @@ def _step_ore(turn: Turn, state: MatchState, role: Unit, claimed: set[Pos]) -> A
         if _adjacent(role.pos, mine) and role.pos != mine:
             claimed.add(mine)
             return (role.unit_id, collect_command(mine))
-    move = _goto_adjacent(turn, role, mines, claimed)
+    move = _goto_adjacent(turn, role, mines, claimed, extra=danger)
     if move is not None:
         return (role.unit_id, move)
     return None
@@ -683,6 +918,7 @@ def _step_buy(
     claimed: set[Pos],
     *,
     absolute: bool = False,
+    gold_limit: int | None = None,
 ) -> Any:
     """到武器商店买 ``count`` 个 ``item``；钱不够就买得起几个买几个。
 
@@ -700,8 +936,11 @@ def _step_buy(
     price = turn.price(item)
     if price <= 0:                      # 不在商店清单里
         return None
-    affordable = min(need, turn.gold // price)
-    if affordable <= 0:                 # 一分钱都买不起 → 让位给后面的步骤
+    # 背包空间不足会导致购买失败（接口/任务书都没说会部分成交），所以按剩余格数截断
+    free = (role.capacity - len(role.backpack)) if role.capacity is not None else need
+    gold = turn.gold if gold_limit is None else min(turn.gold, max(0, gold_limit))
+    affordable = min(need, gold // price, max(0, free))
+    if affordable <= 0:                 # 一分钱都买不起 / 背包没地方 → 让位给后面的步骤
         return None
     shop = turn.nearest_zone(role.pos, WEAPON_SHOP)
     if shop is None:
@@ -734,26 +973,174 @@ def _step_stance(turn: Turn, role: Unit, layout: tactics.Layout, claimed: set[Po
     return WAIT
 
 
-def _step_station_voucher(turn: Turn, role: Unit, claimed: set[Pos]) -> Any:
-    """备一张基地升级券 1（只在基地还是 1 级、手里没有、钱够时去买）。
+def _step_recall(
+    turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout, claimed: set[Pos]
+) -> Any:
+    """第 4 天起：天黑前必须回到夜间站位（优先级高于挖矿与购买）。
 
-    脚本原话是第 1 天白天买，但第 1 天往往钱不够（初始 75 金全用来造炮了），
-    所以这里做成"第 1~3 天持续尝试"的目标，买到就不再跑动。
+    判据：``剩余白天回合 <= 到站位的距离 + RECALL_MARGIN`` 就立刻回位。
+    到位后返回 WAIT（不许再跑去挖矿，免得最后几回合又离位）。
     """
+    if role.kind == PIONEER:
+        # 开拓者每一天都要回开火位：黑夜第一回合就必须能开炮（不能把回合花在路上）
+        stance = layout.pioneer_stand
+    elif turn.day < 4:                  # 工人前 3 天夜里是挖矿，不需要回位
+        return None
+    else:
+        stance = (
+            layout.night_worker_a
+            if _worker_label(state, role, turn.workers()) == "A"
+            else layout.night_worker_b
+        )
+    remaining = DAY_ROUNDS - turn.round_in_day
+    # 必须用**真实路径长度**：围栏有开口，直线 2 格可能要绕 8 步，
+    # 用切比雪夫距离会算得太乐观、回位起步太晚（实测第 4 天就迟到）。
+    steps = path_length(turn, role, stance)
+    if steps is None:                   # 站位暂时到不了：先原地待命，别再跑远
+        return WAIT
+    margin = (
+        PIONEER_RECALL_MARGIN if role.kind == PIONEER else tactics.RECALL_MARGIN
+    )
+    if remaining > steps + margin:
+        return None                     # 时间还够，继续干活
+    if role.pos == stance:
+        return WAIT                     # 已到位：最后几回合原地待命
+    move = _goto_exact(turn, role, stance, claimed)
+    if move is not None:
+        return (role.unit_id, move)
+    return WAIT
+
+
+def _step_pioneer_buy(
+    turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout, claimed: set[Pos]
+) -> Any:
+    """开拓者每天最多买一次，且只在白天前 50 回合内下单。
+
+    优先级（选手要求）：武器升级券（先券1、3 把都 2 级后改券2）
+    > 基地升级券1（第 6 天起、基地还是 1 级）
+    > 基地升级券2（核心 10 面墙全 3 级、基地 2 级）。
+    超过第 50 回合就当天不买（回攻击位）。
+    """
+    key = (turn.day, role.unit_id)
+    if key in state.daily_purchase:
+        return None                     # 今天已经买过 / 已放弃
+
+    weapons = turn.weapons()
+    if len(weapons) < 3:
+        return None                     # 3 座武器还没造齐，先不买
     station = turn.station()
-    if station is None or station.level >= 2:
-        return None                          # 基地已 2 级，券 1 没用了
-    if role.count_ci(STATION_VOUCHER1) > 0:
-        return None                          # 手里已有
-    return _step_buy(turn, role, STATION_VOUCHER1, 1, claimed, absolute=True)
+    item: str | None = None
+    if any(tower.level < 2 for tower in weapons):
+        item = WEAPON_VOUCHER[1]
+    elif any(tower.level < 3 for tower in weapons):
+        item = WEAPON_VOUCHER[2]
+    elif station is not None and station.level == 1 and turn.day >= 6:
+        item = STATION_VOUCHER1
+    elif station is not None and station.level == 2:
+        # 券 2 提前买好放着，"使用"仍严格门限在核心墙全 3 级之后（见 _step_use_vouchers）。
+        # 之前不提前买是因为它会挤掉墙券的钱；现在有 FIXER_CHAIN_RESERVE=400 保底，
+        # 提前买不会影响墙升级，反而能让"墙满级 → 基地 3 级"这条链当天就走完。
+        item = STATION_VOUCHER2
+    if item is None:
+        return None
+
+    # 第 50 回合是**决断时刻**（选手口径："前 50 回合没攒够钱就不买"）：
+    # 钱够就允许把这单走完（从基地走到商店还要十几个回合），钱不够才当天放弃。
+    if turn.round_in_day > tactics.PIONEER_BUY_UNTIL_ROUND:
+        if turn.gold < turn.price(item) or turn.round_in_day > 65:
+            state.daily_purchase.add(key)
+            return None
+
+    need = 1
+    if item == WEAPON_VOUCHER[1]:
+        need = sum(1 for tower in weapons if tower.level < 2)
+    elif item == WEAPON_VOUCHER[2]:
+        need = sum(1 for tower in weapons if tower.level < 3)
+    outcome = _step_buy(turn, role, item, need, claimed, absolute=True)
+    if outcome is not None and outcome[1].get("action") == "buy":
+        state.daily_purchase.add(key)   # 今天这一单已经下了
+    return outcome
+
+
+def _step_use_vouchers(
+    turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout, claimed: set[Pos]
+) -> Any:
+    """用手里的券升级武器与基地（买完就去攻击位升级）。
+
+    升级券要求站在目标建筑周围一格内（任务书 4.6.3）；攻击位同时贴着 3 座火箭炮，
+    所以"买完立刻去攻击位"天然满足这个距离要求。
+    """
+    for tower in sorted(turn.weapons(), key=lambda t: (t.level, t.pos.x, t.pos.y)):
+        if tower.level < 2:
+            item = WEAPON_VOUCHER[1]
+        elif tower.level < 3:
+            item = WEAPON_VOUCHER[2]
+        else:
+            continue
+        if role.count_ci(item) <= 0:
+            continue
+        if distance(role.pos, tower.pos) <= 1 and role.pos != tower.pos:
+            return (role.unit_id, use_command(item, tower.pos))
+        move = _goto_adjacent(turn, role, (tower.pos,), claimed)
+        if move is not None:
+            return (role.unit_id, move)
+
+    station = turn.station()
+    if station is not None:
+        item = None
+        # 券 1（基地 1→2 级）拿到就用：+1500 血本身就是收益，且这样才有时间走完
+        # "墙全 3 级 → 基地 3 级"这条链（实测攥着不用会导致基地到不了 3 级）。
+        # 券 2（2→3 级）按选手要求门限在"核心 10 面墙全 3 级"之后。
+        if station.level == 1 and role.count_ci(STATION_VOUCHER1) > 0:
+            item = STATION_VOUCHER1
+        elif (
+            station.level == 2
+            and role.count_ci(STATION_VOUCHER2) > 0
+            and _core_walls_maxed(turn, layout)
+        ):
+            item = STATION_VOUCHER2
+        if item is not None:
+            # 基地占 2x2：把 targetPos 指定为离自己最近的那一格，
+            # 这样"站在目标周围一格内"的判定在任何实现下都成立
+            target_cell = min(
+                station_footprint(station.pos),
+                key=lambda cell: (distance(role.pos, cell), cell.x, cell.y),
+            )
+            if distance(role.pos, target_cell) <= 1:
+                return (role.unit_id, use_command(item, target_cell))
+            move = _goto_adjacent(turn, role, station_footprint(station.pos), claimed)
+            if move is not None:
+                return (role.unit_id, move)
+    return None
+
+
+def _pioneer_stands(turn: Turn, role: Unit, layout: tactics.Layout) -> list[Pos]:
+    """候选开火位，按优先级排序。
+
+    1. 脚本规定的站位与其备选；
+    2. **兜底：任何"贴着某座火箭炮"的空格**——三个站位都被机器人/敌人占了时，
+       开拓者也要能贴上任意一座炮开火，绝不整夜干看着（选手要求：不能放过任何一个
+       可以攻击的回合）。
+    """
+    stands: list[Pos] = []
+    for pos in (layout.pioneer_stand, *layout.pioneer_fallbacks):
+        if pos == role.pos or turn.free(pos, role):
+            stands.append(pos)
+    for rocket in layout.rockets:
+        if turn.tower_at(rocket) is None:
+            continue
+        for cell in cells_within(rocket, 1):
+            if cell in stands or not turn.land(cell):
+                continue
+            if cell not in turn.blocked(role):
+                stands.append(cell)
+    return stands
 
 
 def _pioneer_stand(turn: Turn, role: Unit, layout: tactics.Layout) -> Pos:
-    """挑一个当前可站的站位：优先首选，其次备选；都被占就仍返回首选。"""
-    for pos in (layout.pioneer_stand, *layout.pioneer_fallbacks):
-        if pos == role.pos or turn.free(pos, role):
-            return pos
-    return layout.pioneer_stand
+    """首选开火位（给"回到哪"一个确定的答案）。"""
+    stands = _pioneer_stands(turn, role, layout)
+    return stands[0] if stands else layout.pioneer_stand
 
 
 def _step_guard(
@@ -772,36 +1159,37 @@ def _step_guard(
         and role.count_ci(STATION_VOUCHER1) > 0
     ):
         footprint = station_footprint(station.pos)
-        if footprint_distance(role.pos, footprint) <= 1:
+        target_cell = min(
+            footprint, key=lambda cell: (distance(role.pos, cell), cell.x, cell.y)
+        )
+        if distance(role.pos, target_cell) <= 1:
             LOGGER.info("station hp=%s -> using %s", station.health, STATION_VOUCHER1)
-            return (role.unit_id, use_command(STATION_VOUCHER1, station.pos))
+            return (role.unit_id, use_command(STATION_VOUCHER1, target_cell))
         # 有券但离基地太远：先往基地靠（升级券要求站在目标建筑周围一格内）
         move = _goto_adjacent(turn, role, footprint, claimed)
         if move is not None:
             return (role.unit_id, move)
 
-    stand = _pioneer_stand(turn, role, layout)
-    if role.pos != stand:
+    # 就位开火：优先站位，其次备选，最后"随便贴一座炮"。
+    # 只要有一线可能就开火——不能因为站位被占而整夜不放炮。
+    for stand in _pioneer_stands(turn, role, layout):
+        if role.pos == stand:
+            return _fire(turn, state, role, layout)
         move = _goto_exact(turn, role, stand, claimed)
+        if move is None:
+            move = _goto_adjacent(turn, role, (stand,), claimed)
         if move is not None:
             return (role.unit_id, move)
-        move = _goto_adjacent(turn, role, (stand,), claimed)
-        if move is not None:
-            return (role.unit_id, move)
-        return WAIT   # 站位被占/到不了：这回合先不动（也别去干别的）
+    # 一个候选位都到不了：原地试一下（万一正好贴着某座炮），不行就等下一回合
     return _fire(turn, state, role, layout)
 
 
 def _fire(turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout) -> Any:
     """轮转操控 3 座火箭炮开火。
 
-    火箭发射台每次发射后有 3 回合冷却（任务书 4.5.1），而我们有 3 座，
-    所以"每回合换一座打"正好让每回合都有且只有一发，火力利用率最高——
-    这就是脚本里那个开火顺序的由来。
-
-    从 ``state.attack_index`` 开始依次找"没在冷却 + 自己够得着 + 有目标"的炮；
-    找到就开火并把下标推进一位（形成轮转）；一圈都没有就这回合不开火。
-    操控距离要求：角色必须站在武器周围一格内（任务书 4.4）。
+    每座火箭炮发射后有 3 回合冷却（任务书 4.5.1），3 座轮着来正好每回合一发。
+    落点交给 ``_plan_volley``：按**当回合 request 里的实时血量**分配，
+    武器几级就打几发（升级后可打多发），并且只打自己这一边的机器人。
     """
     total = len(layout.rockets)
     if not total:
@@ -814,44 +1202,82 @@ def _fire(turn: Turn, state: MatchState, role: Unit, layout: tactics.Layout) -> 
         if tower is None or tower.cooldown > 0:
             continue                       # 这座还没造出来 / 还在冷却
         if distance(role.pos, position) > 1:
-            continue                       # 站远了操控不了（比如退到备选站位时）
-        target = _pick_target(turn, tower)
-        if target is None:
-            continue                       # 射程内没有机器人
+            continue                       # 站远了操控不了
+        targets = _plan_volley(turn, tower)
+        if not targets:
+            continue                       # 射程内（且在自己这边）没有机器人
         state.attack_index = index + 1     # 下回合从下一座开始
-        # 命令的 key 是武器工事 ID，controllerId 才是开拓者 ID（接口文档 2.2）
-        return (tower.unit_id, attack_command(role.unit_id, (target,)))
+        return (tower.unit_id, attack_command(role.unit_id, targets))
     return None
 
 
-def _pick_target(turn: Turn, tower: Unit) -> Pos | None:
-    """挑一个攻击落点。
+def _plan_volley(turn: Turn, tower: Unit) -> list[Pos]:
+    """给这一炮分配落点，目标是"伤害不过度溢出"。
 
-    优先级：中型 > 小型 > 大型 > BOSS（脚本给定的顺序，也是"每发火箭换多少分"
-    最优的顺序：中型 2 分/3 发 = 0.67，小型 1 分/2 发 = 0.5，BOSS 10 分/40 发 = 0.25，
-    大型 4 分/25 发 = 0.16）。同类型里选离炮最近的，再按 ID 稳定排序。
-
-    已知可改进点：不考虑"补刀"（优先打死血少的）与"溅射覆盖"
-    （火箭 8 格溅射、多枚落点重叠时伤害叠加），也永远只传 1 个 targetPos，
-    所以武器升到 2/3 级后必须同时改成传对应数量的落点，否则攻击非法。
+    * 落点个数 = 武器等级（加特林/火箭可打多发；电磁狙击炮只能传 1 个，接口文档 2.2）；
+    * **只打自己这一边**：``|基地y - 机器人y| <= OUR_SIDE_Y_SPAN``（选手要求）；
+    * 同一目标重复落点会叠加伤害（任务书 4.5.4"多枚导弹落点重叠时伤害叠加"），
+      所以按"还差几发才能打死"排序：先打快死的，发数够了就换下一个目标，
+      不把多余的导弹浪费在已经必死的目标上。
     """
+    station = turn.station()
+    if station is None:
+        return []
+    level = max(1, int(tower.level or 1))
+    if tower.kind not in ("rocket", "gatling"):
+        level = 1                          # 电磁狙击炮只有 1 个落点
     reach = tower.range_of_attack()
     candidates = [
         robot
         for robot in turn.robots
-        if robot.health > 0 and distance(tower.pos, robot.pos) <= reach
+        if robot.health > 0
+        and distance(tower.pos, robot.pos) <= reach
+        and abs(station.pos.y - robot.pos.y) <= OUR_SIDE_Y_SPAN
     ]
     if not candidates:
-        return None
-    candidates.sort(
-        key=lambda robot: (robot.priority, distance(tower.pos, robot.pos), robot.robot_id)
+        return []
+    ammo = DAMAGE_PER_MISSILE if tower.kind == "rocket" else DAMAGE_OTHER_WEAPON
+    remaining = {robot.robot_id: robot.health for robot in candidates}
+    shots: list[Pos] = []
+    for _ in range(level):
+        live = [robot for robot in candidates if remaining[robot.robot_id] > 0]
+        if not live:
+            # 目标已被前面的落点覆盖完了，但接口要求"落点数 = 武器等级"，
+            # 所以还必须补足发数：挑一个"溅射收益最大"的已打落点重复一次
+            # （同一落点重叠只叠加中心伤害，溅射仍能照顾到旁边还活着的机器人）。
+            shots.append(_best_pad(shots, candidates, remaining))
+            continue
+        live.sort(
+            key=lambda robot: (
+                robot.priority,                             # 脚本优先级：中>小>大>BOSS
+                -(-remaining[robot.robot_id] // ammo),      # 再挑"快死的"
+                remaining[robot.robot_id],
+                robot.robot_id,
+            )
+        )
+        target = live[0]
+        shots.append(target.pos)
+        remaining[target.robot_id] -= ammo
+    return shots
+
+
+def _best_pad(
+    shots: list[Pos], candidates: Sequence[Robot], remaining: dict[int, int]
+) -> Pos:
+    """挑一个补位落点：优先"周围还活着的机器人最多"的那个已打落点。"""
+    live = [robot.pos for robot in candidates if remaining[robot.robot_id] > 0]
+    if not shots:                          # 理论上不会发生（调用前已确认有候选）
+        return candidates[0].pos
+    return max(
+        shots,
+        key=lambda shot: (
+            sum(1 for pos in live if pos != shot and distance(shot, pos) <= 1),
+            -shot.x,
+            -shot.y,
+        ),
     )
-    return candidates[0].pos
 
 
-# --------------------------------------------------------------------------
-# 夜间修墙调度
-# --------------------------------------------------------------------------
 def _assign_repairs(
     turn: Turn, layout: tactics.Layout, workers: Sequence[Unit]
 ) -> dict[int, Pos]:
